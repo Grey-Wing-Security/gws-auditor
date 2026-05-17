@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "google-workspace-security-auditor"
+version = "0.1.0"
+description = "Read-only Google Workspace security assessment tooling"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dependencies = [
+  "requests>=2.31.0",
+  "google-auth>=2.30.0",
+  "google-auth-oauthlib>=1.2.0",
+  "dnspython>=2.6.1",
+]
+
+[project.scripts]
+workspace-audit = "workspace_audit:main"
+email-domain-check = "email_domain_check:main"

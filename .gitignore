@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Local outputs
+*.json
+*.csv
+*.html
+*.pdf
+
+# Keys/tokens
+*client_secret*.json
+*service-account*.json
+*token*.json
