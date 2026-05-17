@@ -14,7 +14,6 @@ dependencies = [
   "google-auth>=2.30.0",
   "google-auth-oauthlib>=1.2.0",
   "dnspython>=2.6.1",
-  "reportlab>=4.2.0",
 ]
 
 [project.scripts]

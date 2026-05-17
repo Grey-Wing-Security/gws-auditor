@@ -1129,7 +1129,8 @@ def severity_rank(sev):
     return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(str(sev).lower(), 9)
 
 
-def build_recommendations(summary):
+def render_report_html(findings, customer, prepared_by, logo_url):
+    summary = findings.get("summary", {})
     recommendations = []
     if summary.get("usersWithout2SVEnrollment", 0) > 0:
         recommendations.append("Require 2SV enrollment for all remaining users and enforce hardware-backed MFA for privileged roles.")
@@ -1155,12 +1156,6 @@ def build_recommendations(summary):
         recommendations.append("Block non-compliant mobile devices and enforce full-disk encryption in endpoint management policy.")
     if not recommendations:
         recommendations.append("Maintain current baseline and schedule monthly security telemetry reviews.")
-    return recommendations
-
-
-def render_report_html(findings, customer, prepared_by, logo_url):
-    summary = findings.get("summary", {})
-    recommendations = build_recommendations(summary)
 
     rows = []
     sorted_findings = sorted(findings.get("findings", []), key=lambda x: severity_rank(x.get("severity")))
@@ -1260,113 +1255,6 @@ def build_report(args):
     print(f"Report written to: {args.out_html}")
 
 
-def build_report_pdf(args):
-    try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import letter
-        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-        from reportlab.lib.units import inch
-        from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-    except Exception:
-        raise RuntimeError("Missing dependency: reportlab. Install with: pip install reportlab")
-
-    findings = read_json(args.findings)
-    summary = findings.get("summary", {})
-    recommendations = build_recommendations(summary)
-    sorted_findings = sorted(findings.get("findings", []), key=lambda x: severity_rank(x.get("severity")))
-
-    doc = SimpleDocTemplate(
-        args.out_pdf,
-        pagesize=letter,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=36,
-        bottomMargin=36,
-    )
-
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("TitleCustom", parent=styles["Heading1"], fontSize=20, leading=24, spaceAfter=10)
-    h2_style = ParagraphStyle("H2Custom", parent=styles["Heading2"], fontSize=14, leading=18, spaceBefore=12, spaceAfter=6)
-    normal_style = ParagraphStyle("NormalCustom", parent=styles["BodyText"], fontSize=10, leading=13)
-    small_style = ParagraphStyle("SmallCustom", parent=styles["BodyText"], fontSize=9, leading=12, textColor=colors.HexColor("#4b5563"))
-
-    elements = []
-    if args.logo_path and os.path.exists(args.logo_path):
-        logo = Image(args.logo_path)
-        logo.drawHeight = 0.7 * inch
-        logo.drawWidth = 2.8 * inch
-        elements.append(logo)
-        elements.append(Spacer(1, 8))
-
-    elements.append(Paragraph("Google Workspace Security Assessment", title_style))
-    elements.append(Paragraph(f"<b>Customer:</b> {html.escape(args.customer)}", small_style))
-    elements.append(Paragraph(f"<b>Prepared by:</b> {html.escape(args.prepared_by)}", small_style))
-    elements.append(Paragraph(f"<b>Generated:</b> {html.escape(str(findings.get('generatedAt', to_iso(utc_now()))))}", small_style))
-    elements.append(Spacer(1, 10))
-
-    elements.append(Paragraph("Executive Summary", h2_style))
-    metric_rows = [
-        ["Metric", "Value"],
-        ["Active Users", str(summary.get("activeUsers", 0))],
-        ["Users Not Enrolled in 2SV", str(summary.get("usersWithout2SVEnrollment", 0))],
-        ["High-Impact OAuth Grants", str(summary.get("riskyOAuthGrants", 0))],
-        ["Suspicious Login Events (30d)", str(summary.get("suspiciousLoginEvents30d", 0))],
-        ["External Sharing Events (30d)", str(summary.get("externalSharingEvents30d", 0))],
-        ["Files with Anyone-Link Access", str(summary.get("filesAnyoneWithLink", 0))],
-        ["Domain Health Score", f"{summary.get('domainHealthScore', 0)} ({summary.get('domainHealthGrade', 'N/A')})"],
-    ]
-    metric_table = Table(metric_rows, colWidths=[3.9 * inch, 2.4 * inch])
-    metric_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
-            ]
-        )
-    )
-    elements.append(metric_table)
-
-    elements.append(Paragraph("Risk Register", h2_style))
-    risk_rows = [["Severity", "Finding", "Count", "Recommended Action"]]
-    for item in sorted_findings:
-        risk_rows.append(
-            [
-                Paragraph(html.escape(str(item.get("severity", "unknown")).title()), normal_style),
-                Paragraph(html.escape(str(item.get("title", ""))), normal_style),
-                Paragraph(html.escape(str(item.get("count", 0))), normal_style),
-                Paragraph(html.escape(str(item.get("remediation", ""))), normal_style),
-            ]
-        )
-    risk_table = Table(risk_rows, colWidths=[0.9 * inch, 2.35 * inch, 0.8 * inch, 2.25 * inch])
-    risk_table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3f4f6")),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#d1d5db")),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8.8),
-                ("LEFTPADDING", (0, 0), (-1, -1), 5),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-            ]
-        )
-    )
-    elements.append(risk_table)
-
-    elements.append(Paragraph("Recommended Changes", h2_style))
-    for idx, rec in enumerate(recommendations, start=1):
-        elements.append(Paragraph(f"{idx}. {html.escape(rec)}", normal_style))
-
-    doc.build(elements)
-    print(f"PDF report written to: {args.out_pdf}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1392,14 +1280,6 @@ def main():
     p_report.add_argument("--prepared-by", required=True)
     p_report.add_argument("--logo-url")
     p_report.set_defaults(func=build_report)
-
-    p_pdf = sub.add_parser("build-pdf")
-    p_pdf.add_argument("--findings", required=True)
-    p_pdf.add_argument("--out-pdf", required=True)
-    p_pdf.add_argument("--customer", required=True)
-    p_pdf.add_argument("--prepared-by", required=True)
-    p_pdf.add_argument("--logo-path")
-    p_pdf.set_defaults(func=build_report_pdf)
 
     args = parser.parse_args()
     args.func(args)
