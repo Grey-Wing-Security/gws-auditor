@@ -94,6 +94,9 @@ LOGO_MIME_BY_EXT = {
     ".svg": "image/svg+xml",
 }
 
+REPORTS_ACTIVITY_BASE_URL = "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications"
+REPORTS_ACTIVITY_PAGE_SIZE = 1000
+
 
 def utc_now():
     return dt.datetime.now(dt.timezone.utc)
@@ -186,6 +189,15 @@ def paged_get(url, item_key, access_token, params=None):
             break
         query["pageToken"] = token
     return out
+
+
+def paged_report_activities(application_name, access_token, start_time):
+    return paged_get(
+        f"{REPORTS_ACTIVITY_BASE_URL}/{application_name}",
+        "items",
+        access_token,
+        {"startTime": start_time, "maxResults": REPORTS_ACTIVITY_PAGE_SIZE},
+    )
 
 
 def safe_tokens_for_user(access_token, user_email):
@@ -513,12 +525,7 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                 )
 
     start_time = to_iso(utc_now() - dt.timedelta(days=30))
-    login_activities = paged_get(
-        "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications/login",
-        "items",
-        access_token,
-        {"startTime": start_time, "maxResults": 1000},
-    )
+    login_activities = paged_report_activities("login", access_token, start_time)
     suspicious_logins = []
     event_counts = {}
     for activity in login_activities:
@@ -539,30 +546,15 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
     token_activities = []
     groups_activities = []
     try:
-        admin_activities = paged_get(
-            "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications/admin",
-            "items",
-            access_token,
-            {"startTime": start_time, "maxResults": 1000},
-        )
+        admin_activities = paged_report_activities("admin", access_token, start_time)
     except Exception:
         admin_activities = []
     try:
-        token_activities = paged_get(
-            "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications/token",
-            "items",
-            access_token,
-            {"startTime": start_time, "maxResults": 1000},
-        )
+        token_activities = paged_report_activities("token", access_token, start_time)
     except Exception:
         token_activities = []
     try:
-        groups_activities = paged_get(
-            "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications/groups",
-            "items",
-            access_token,
-            {"startTime": start_time, "maxResults": 1000},
-        )
+        groups_activities = paged_report_activities("groups", access_token, start_time)
     except Exception:
         groups_activities = []
 
@@ -581,12 +573,7 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
 
     drive_activities = []
     try:
-        drive_activities = paged_get(
-            "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications/drive",
-            "items",
-            access_token,
-            {"startTime": start_time, "maxResults": 1000},
-        )
+        drive_activities = paged_report_activities("drive", access_token, start_time)
     except Exception:
         drive_activities = []
 
