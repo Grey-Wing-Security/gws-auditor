@@ -7,9 +7,11 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 import urllib.parse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from google.auth.transport.requests import Request
@@ -116,6 +118,10 @@ def score_grade(score):
     return "F"
 REPORTS_ACTIVITY_BASE_URL = "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications"
 REPORTS_ACTIVITY_PAGE_SIZE = 1000
+TOKEN_SCAN_MAX_WORKERS = 8
+TOKEN_SCAN_REQUESTS_PER_SECOND = 6.0
+USER_OWNER_SCAN_MAX_WORKERS = 4
+USER_OWNER_SCAN_REQUESTS_PER_SECOND = 1.5
 
 
 def utc_now():
@@ -124,6 +130,26 @@ def utc_now():
 
 def to_iso(ts):
     return ts.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+class CallRateLimiter:
+    def __init__(self, calls_per_second):
+        self.calls_per_second = max(0.0, float(calls_per_second))
+        self.interval_seconds = 0.0 if self.calls_per_second <= 0 else (1.0 / self.calls_per_second)
+        self.next_allowed_at = 0.0
+        self.lock = threading.Lock()
+
+    def wait_for_slot(self):
+        if self.interval_seconds <= 0:
+            return
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                if now >= self.next_allowed_at:
+                    self.next_allowed_at = now + self.interval_seconds
+                    return
+                wait_seconds = self.next_allowed_at - now
+            time.sleep(wait_seconds)
 
 
 def load_client(client_secret_path):
@@ -413,6 +439,116 @@ def parse_login_time(raw):
         return None
 
 
+def collect_risky_tokens_for_users(access_token, active_users):
+    user_emails = [u.get("primaryEmail") for u in active_users if u.get("primaryEmail")]
+    if not user_emails:
+        return []
+
+    limiter = CallRateLimiter(TOKEN_SCAN_REQUESTS_PER_SECOND)
+
+    def scan_user_tokens(email):
+        limiter.wait_for_slot()
+        user_risky_tokens = []
+        for t in safe_tokens_for_user(access_token, email):
+            scopes = t.get("scopes", [])
+            if contains_risky_scope(scopes):
+                user_risky_tokens.append(
+                    {
+                        "user": email,
+                        "app": t.get("displayText"),
+                        "clientId": t.get("clientId"),
+                        "anonymous": t.get("anonymous"),
+                        "nativeApp": t.get("nativeApp"),
+                        "scopes": scopes,
+                    }
+                )
+        return user_risky_tokens
+
+    risky_tokens = []
+    max_workers = max(1, min(TOKEN_SCAN_MAX_WORKERS, len(user_emails)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(scan_user_tokens, email) for email in user_emails]
+        for future in as_completed(futures):
+            try:
+                risky_tokens.extend(future.result())
+            except Exception:
+                continue
+    return risky_tokens
+
+
+def collect_user_owner_drive_visibility(service_account_key, active_users):
+    user_owner_users_scanned = 0
+    user_owner_scan_errors = []
+    user_owner_anyone_link_map = {}
+    user_owner_public_web_map = {}
+    if not service_account_key:
+        return {
+            "user_owner_users_scanned": user_owner_users_scanned,
+            "user_owner_scan_errors": user_owner_scan_errors,
+            "user_owner_anyone_link_files": list(user_owner_anyone_link_map.values()),
+            "user_owner_public_web_files": list(user_owner_public_web_map.values()),
+        }
+
+    user_emails = [u.get("primaryEmail") for u in active_users if u.get("primaryEmail")]
+    if not user_emails:
+        return {
+            "user_owner_users_scanned": user_owner_users_scanned,
+            "user_owner_scan_errors": user_owner_scan_errors,
+            "user_owner_anyone_link_files": list(user_owner_anyone_link_map.values()),
+            "user_owner_public_web_files": list(user_owner_public_web_map.values()),
+        }
+
+    limiter = CallRateLimiter(USER_OWNER_SCAN_REQUESTS_PER_SECOND)
+
+    def scan_user_drive(email):
+        limiter.wait_for_slot()
+        try:
+            return email, safe_user_public_files_scan(service_account_key, email), None
+        except Exception as e:
+            return email, None, str(e)[:400]
+
+    max_workers = max(1, min(USER_OWNER_SCAN_MAX_WORKERS, len(user_emails)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_email = {executor.submit(scan_user_drive, email): email for email in user_emails}
+        for future in as_completed(future_to_email):
+            fallback_email = future_to_email[future]
+            try:
+                email, scan, err = future.result()
+            except Exception as e:
+                user_owner_scan_errors.append({"user": fallback_email, "error": str(e)[:400]})
+                continue
+            if err:
+                user_owner_scan_errors.append({"user": email, "error": err})
+                continue
+
+            user_owner_users_scanned += 1
+            for f in scan.get("anyone_with_link", []):
+                fid = f.get("id") or ""
+                rec = {
+                    "id": fid,
+                    "name": f.get("name"),
+                    "webViewLink": f.get("webViewLink"),
+                    "owner": ((f.get("owners") or [{}])[0].get("emailAddress")) or email,
+                }
+                user_owner_anyone_link_map[fid or f"{email}:{f.get('name','')}"] = rec
+            for f in scan.get("public_on_web", []):
+                fid = f.get("id") or ""
+                rec = {
+                    "id": fid,
+                    "name": f.get("name"),
+                    "webViewLink": f.get("webViewLink"),
+                    "owner": ((f.get("owners") or [{}])[0].get("emailAddress")) or email,
+                }
+                user_owner_public_web_map[fid or f"{email}:{f.get('name','')}"] = rec
+
+    return {
+        "user_owner_users_scanned": user_owner_users_scanned,
+        "user_owner_scan_errors": user_owner_scan_errors,
+        "user_owner_anyone_link_files": list(user_owner_anyone_link_map.values()),
+        "user_owner_public_web_files": list(user_owner_public_web_map.values()),
+    }
+
+
 def domain_health_penalties(summary):
     active = max(1, int(summary.get("activeUsers", 0)))
     return {
@@ -584,27 +720,8 @@ def collect_super_admins(access_token, user_by_id, active_users):
         "super_admin_without_2sv": super_admin_without_2sv,
     }
 
-
 def collect_risky_tokens(access_token, active_users):
-    risky_tokens = []
-    for u in active_users:
-        email = u.get("primaryEmail")
-        if not email:
-            continue
-        tokens = safe_tokens_for_user(access_token, email)
-        for t in tokens:
-            scopes = t.get("scopes", [])
-            if contains_risky_scope(scopes):
-                risky_tokens.append(
-                    {
-                        "user": email,
-                        "app": t.get("displayText"),
-                        "clientId": t.get("clientId"),
-                        "anonymous": t.get("anonymous"),
-                        "nativeApp": t.get("nativeApp"),
-                        "scopes": scopes,
-                    }
-                )
+    risky_tokens = collect_risky_tokens_for_users(access_token, active_users)
     return risky_tokens
 
 
@@ -840,47 +957,8 @@ def collect_groups_exposure(access_token):
         "groups_settings_errors": groups_settings_errors,
     }
 
-
 def collect_user_owner_drive_scan(service_account_key, active_users):
-    user_owner_users_scanned = 0
-    user_owner_scan_errors = []
-    user_owner_anyone_link_map = {}
-    user_owner_public_web_map = {}
-    if service_account_key:
-        for u in active_users:
-            email = u.get("primaryEmail")
-            if not email:
-                continue
-            try:
-                scan = safe_user_public_files_scan(service_account_key, email)
-                user_owner_users_scanned += 1
-                for f in scan.get("anyone_with_link", []):
-                    fid = f.get("id") or ""
-                    rec = {
-                        "id": fid,
-                        "name": f.get("name"),
-                        "webViewLink": f.get("webViewLink"),
-                        "owner": ((f.get("owners") or [{}])[0].get("emailAddress")) or email,
-                    }
-                    user_owner_anyone_link_map[fid or f"{email}:{f.get('name','')}"] = rec
-                for f in scan.get("public_on_web", []):
-                    fid = f.get("id") or ""
-                    rec = {
-                        "id": fid,
-                        "name": f.get("name"),
-                        "webViewLink": f.get("webViewLink"),
-                        "owner": ((f.get("owners") or [{}])[0].get("emailAddress")) or email,
-                    }
-                    user_owner_public_web_map[fid or f"{email}:{f.get('name','')}"] = rec
-            except Exception as e:
-                user_owner_scan_errors.append({"user": email, "error": str(e)[:400]})
-    return {
-        "user_owner_users_scanned": user_owner_users_scanned,
-        "user_owner_scan_errors": user_owner_scan_errors,
-        "user_owner_anyone_link_files": list(user_owner_anyone_link_map.values()),
-        "user_owner_public_web_files": list(user_owner_public_web_map.values()),
-    }
-
+    return collect_user_owner_drive_visibility(service_account_key, active_users)
 
 def resolve_anyone_link_evidence(
     domain_drive_files,
