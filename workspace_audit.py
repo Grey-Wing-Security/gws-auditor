@@ -1527,6 +1527,34 @@ def render_report_html(findings, customer, prepared_by, logo_url, findings_path=
     token_authorize_count = int(summary.get("tokenAuthorizeEvents30d", token_counts.get("authorize", 0)))
     token_revoke_count = int(summary.get("tokenRevokeEvents30d", token_counts.get("revoke", 0)))
     token_deny_count = int(token_counts.get("deny", 0))
+    risky_oauth_count = int(summary.get("riskyOAuthGrants", 0))
+    suspicious_login_count = int(summary.get("suspiciousLoginEvents30d", 0))
+    external_sharing_event_count = int(summary.get("externalSharingEvents30d", 0))
+    anyone_with_link_count = int(summary.get("filesAnyoneWithLink", 0))
+    public_on_web_count = int(summary.get("filesPublicOnWeb", 0))
+
+    executive_risk_points = []
+    if risky_oauth_count > 0:
+        executive_risk_points.append(f"{risky_oauth_count} high-impact OAuth grant{'s' if risky_oauth_count != 1 else ''}")
+    if suspicious_login_count > 0:
+        executive_risk_points.append(f"{suspicious_login_count} risky/failed login event{'s' if suspicious_login_count != 1 else ''}")
+    if external_sharing_event_count > 0:
+        executive_risk_points.append(f"{external_sharing_event_count} external sharing event{'s' if external_sharing_event_count != 1 else ''}")
+    if anyone_with_link_count > 0:
+        executive_risk_points.append(f"{anyone_with_link_count} file{'s' if anyone_with_link_count != 1 else ''} accessible via anyone-with-link")
+    if public_on_web_count > 0:
+        executive_risk_points.append(f"{public_on_web_count} publicly discoverable file{'s' if public_on_web_count != 1 else ''}")
+
+    if executive_risk_points:
+        if len(executive_risk_points) == 1:
+            executive_risk_summary = executive_risk_points[0]
+        elif len(executive_risk_points) == 2:
+            executive_risk_summary = f"{executive_risk_points[0]} and {executive_risk_points[1]}"
+        else:
+            executive_risk_summary = ", ".join(executive_risk_points[:-1]) + f", and {executive_risk_points[-1]}"
+        executive_findings_sentence = f"The assessment identified {executive_risk_summary}, requiring review and remediation."
+    else:
+        executive_findings_sentence = "The assessment did not detect high-risk OAuth grants, risky/failed login patterns, or notable external sharing exposure in the collected window."
 
     email_health = email_health or {}
     email_summary = email_health.get("summary", {})
@@ -1656,7 +1684,7 @@ def render_report_html(findings, customer, prepared_by, logo_url, findings_path=
     <h2>1. Executive Summary</h2>
     <p>
       This report summarizes a read-only security assessment of the Google Workspace environment using Google Admin APIs across identity, authentication, OAuth access, device security, and login telemetry.
-      The assessment identified several high-risk OAuth grants, repeated risky/failed login patterns, and notable external sharing activity requiring immediate review.
+      {html.escape(executive_findings_sentence)}
     </p>
     <p><strong>Overall Workspace Security Posture Score:</strong> <strong>{score_data["score"]} / 100 (Grade: {html.escape(score_data["grade"])})</strong></p>
     <p><strong>Why {score_data["score"]}:</strong> this posture score starts at 100 and is reduced by weighted risk factors across identity, OAuth, login risk, sharing, and stale accounts.</p>
