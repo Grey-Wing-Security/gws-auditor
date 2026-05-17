@@ -5,6 +5,7 @@ import datetime as dt
 import html
 import json
 import os
+import stat
 import sys
 import urllib.parse
 from collections import Counter
@@ -117,6 +118,14 @@ def write_json(path, data):
         json.dump(data, f, indent=2)
 
 
+def write_token_json(path, data):
+    write_json(path, data)
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except Exception:
+        pass
+
+
 def read_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -138,7 +147,7 @@ def auth_login(args):
     }
     if creds.refresh_token:
         token["refresh_token"] = creds.refresh_token
-    write_json(args.token, token)
+    write_token_json(args.token, token)
     print(f"Token saved to: {args.token}")
 
 
@@ -1118,7 +1127,7 @@ def run_audit(args):
         if is_expired(token):
             if client_id and client_secret and token.get("refresh_token"):
                 token = refresh_access_token(token, client_id, client_secret)
-                write_json(args.token, token)
+                write_token_json(args.token, token)
             else:
                 raise RuntimeError("Access token expired and no refresh path available.")
         access_token = token["access_token"]

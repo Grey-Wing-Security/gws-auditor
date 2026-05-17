@@ -107,4 +107,5 @@ python email_domain_check.py \
 
 - This tool is designed for **read-only** collection.
 - Do not commit token files, OAuth client secrets, or service account keys.
+- OAuth token files written by `auth-login` are set to owner read/write permissions (`0600`-equivalent); still treat them as secrets and never share them.
 - Prefer delegated service account mode for complete, repeatable tenant-wide collection.
