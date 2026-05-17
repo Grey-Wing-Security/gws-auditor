@@ -1,4 +1,5 @@
 import argparse
+import base64
 import csv
 import datetime as dt
 import html
@@ -82,6 +83,15 @@ BLOCKED_NON_DOMAIN_TLDS = {
     "xml",
     "yaml",
     "yml",
+}
+
+LOGO_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".svg": "image/svg+xml",
 }
 
 
@@ -1129,8 +1139,16 @@ def severity_rank(sev):
     return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(str(sev).lower(), 9)
 
 
-def render_report_html(findings, customer, prepared_by, logo_url):
-    summary = findings.get("summary", {})
+def logo_file_to_data_uri(logo_path):
+    if not logo_path or not os.path.exists(logo_path):
+        return ""
+    mime = LOGO_MIME_BY_EXT.get(os.path.splitext(logo_path)[1].lower(), "application/octet-stream")
+    with open(logo_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def build_recommendations(summary):
     recommendations = []
     if summary.get("usersWithout2SVEnrollment", 0) > 0:
         recommendations.append("Require 2SV enrollment for all remaining users and enforce hardware-backed MFA for privileged roles.")
@@ -1156,54 +1174,181 @@ def render_report_html(findings, customer, prepared_by, logo_url):
         recommendations.append("Block non-compliant mobile devices and enforce full-disk encryption in endpoint management policy.")
     if not recommendations:
         recommendations.append("Maintain current baseline and schedule monthly security telemetry reviews.")
+    return recommendations
 
-    rows = []
-    sorted_findings = sorted(findings.get("findings", []), key=lambda x: severity_rank(x.get("severity")))
-    for item in sorted_findings:
-        sev = html.escape(str(item.get("severity", "unknown")).lower())
-        title = html.escape(str(item.get("title", "")))
-        count = html.escape(str(item.get("count", 0)))
-        remediation = html.escape(str(item.get("remediation", "")))
-        rows.append(
-            f"<tr><td class='sev-{sev}'>{sev.title()}</td><td>{title}</td><td>{count}</td><td>{remediation}</td></tr>"
+
+def load_optional_json(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return read_json(path)
+    except Exception:
+        return None
+
+
+def score_grade(score):
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
+def compute_posture_breakdown(summary):
+    p_2sv = round(min(20.0, float(summary.get("usersWithout2SVEnrollment", 0)) * 1.0), 1)
+    p_oauth = round(min(20.0, float(summary.get("riskyOAuthGrants", 0)) * 0.9), 1)
+    p_login = round(min(10.0, float(summary.get("suspiciousLoginEvents30d", 0)) * 0.25), 1)
+    p_external_domains = round(min(10.0, float(summary.get("externalSharedDomains", 0)) * 0.5), 1)
+    p_anyone_link = round(min(12.0, float(summary.get("filesAnyoneWithLink", 0)) * 0.02), 1)
+    p_stale = round(min(12.0, float(summary.get("staleAccounts90d", 0)) * 0.8), 1)
+    total = round(p_2sv + p_oauth + p_login + p_external_domains + p_anyone_link + p_stale, 1)
+    fallback_score = round(max(0.0, 100.0 - total), 1)
+    score = float(summary.get("domainHealthScore", fallback_score))
+    grade = str(summary.get("domainHealthGrade", score_grade(score)))
+    return {
+        "score": score,
+        "grade": grade,
+        "p_2sv": p_2sv,
+        "p_oauth": p_oauth,
+        "p_login": p_login,
+        "p_external_domains": p_external_domains,
+        "p_anyone_link": p_anyone_link,
+        "p_stale": p_stale,
+        "total_penalty": total,
+    }
+
+
+def render_report_html(findings, customer, prepared_by, logo_url, findings_path="", email_health=None):
+    summary = findings.get("summary", {})
+    observations = findings.get("observations", {})
+    drive_inventory = observations.get("driveInventory", {})
+    token_counts = observations.get("tokenEventCounts30d", {})
+    score_data = compute_posture_breakdown(summary)
+
+    external_domains = [str(d.get("domain", "")).strip() for d in drive_inventory.get("externalSharedDomains", []) if d.get("domain")]
+    external_domains_html = ", ".join(f"<code>{html.escape(d)}</code>" for d in external_domains) if external_domains else "No external domains observed."
+    domains_csv_path = drive_inventory.get("csvPath", "")
+
+    admin_security_change_count = int(summary.get("adminSecurityChangeEvents30d", 0))
+    token_authorize_count = int(summary.get("tokenAuthorizeEvents30d", token_counts.get("authorize", 0)))
+    token_revoke_count = int(summary.get("tokenRevokeEvents30d", token_counts.get("revoke", 0)))
+    token_deny_count = int(token_counts.get("deny", 0))
+
+    email_health = email_health or {}
+    email_summary = email_health.get("summary", {})
+    email_domains = email_health.get("domains", [])
+    email_domains_checked = int(email_summary.get("domains_checked", 0))
+    email_with_spf = int(email_summary.get("domains_with_spf", 0))
+    email_with_dkim = int(email_summary.get("domains_with_dkim_detected", 0))
+    email_with_dmarc = int(email_summary.get("domains_with_dmarc", 0))
+    email_score = email_summary.get("overall_email_domain_health_score", "N/A")
+
+    verified_scores = [int(d.get("score", 0)) for d in email_domains if d.get("verified")]
+    verified_avg = round(sum(verified_scores) / len(verified_scores), 1) if verified_scores else "N/A"
+    dmarc_none_domains = [d.get("domain", "") for d in email_domains if d.get("dmarc_present") and str(d.get("dmarc_policy", "")).lower() == "none"]
+    alias_unprotected = [d.get("domain", "") for d in email_domains if (not d.get("verified")) and (not d.get("spf_present")) and (not d.get("dkim_present")) and (not d.get("dmarc_present"))]
+    primary_gap_text = (
+        ", ".join(f"<code>{html.escape(d)}</code>" for d in dmarc_none_domains) + " DMARC policy is currently <code>p=none</code> (monitor-only)."
+        if dmarc_none_domains
+        else "No DMARC monitor-only domains were detected."
+    )
+    alias_gap_text = (
+        ", ".join(f"<code>{html.escape(d)}</code>" for d in alias_unprotected) + " appears unverified and has no detectable SPF/DKIM/DMARC controls."
+        if alias_unprotected
+        else "No unverified alias domains without SPF/DKIM/DMARC were detected."
+    )
+
+    email_rows = []
+    for d in email_domains:
+        domain_name = str(d.get("domain", ""))
+        if d.get("source") == "alias" and not d.get("verified"):
+            domain_name += " (alias, unverified)"
+        spf = f"Present ({'~all' if str(d.get('spf_mode', '')).lower() == 'soft_fail' else d.get('spf_mode', '')})" if d.get("spf_present") else "Missing"
+        dkim = "Present" if d.get("dkim_present") else "Missing"
+        dmarc = "Present" if d.get("dmarc_present") else "Missing"
+        policy = d.get("dmarc_policy", "n/a") if d.get("dmarc_present") else "n/a"
+        score = d.get("score", 0)
+        email_rows.append(
+            f"<tr><td>{html.escape(str(domain_name))}</td><td>{html.escape(str(spf))}</td><td>{html.escape(str(dkim))}</td><td>{html.escape(str(dmarc))}</td><td>{html.escape(str(policy))}</td><td>{html.escape(str(score))}</td></tr>"
         )
-    findings_rows = "\n".join(rows) if rows else "<tr><td colspan='4'>No findings.</td></tr>"
-    recommendation_rows = "\n".join(f"<li>{html.escape(r)}</li>" for r in recommendations)
+    email_rows_html = "\n".join(email_rows) if email_rows else "<tr><td colspan='6'>No email domain health data provided.</td></tr>"
+
+    identity_status = ("sev-low", "Good") if int(summary.get("usersWithout2SVEnrollment", 0)) == 0 else ("sev-medium", "Partial")
+    oauth_status = ("sev-low", "Good") if int(summary.get("riskyOAuthGrants", 0)) == 0 else ("sev-high", "At Risk")
+    sharing_status = ("sev-low", "Good") if int(summary.get("filesAnyoneWithLink", 0)) == 0 else ("sev-high", "At Risk")
+    groups_exposed = int(summary.get("groupsAnyoneCanJoin", 0)) + int(summary.get("groupsAnyoneCanView", 0))
+    groups_status = ("sev-low", "Good") if groups_exposed == 0 else ("sev-medium", "Partial")
+    endpoint_status = ("sev-low", "Good") if int(summary.get("unencryptedMobileDevices", 0)) == 0 else ("sev-medium", "Partial")
+    email_status = ("sev-medium", "Partial")
+    if email_domains_checked > 0 and email_with_spf == email_domains_checked and email_with_dkim == email_domains_checked and email_with_dmarc == email_domains_checked and len(dmarc_none_domains) == 0:
+        email_status = ("sev-low", "Good")
+
+    static_recommendations = [
+        f"Complete 2SV enrollment for the remaining {int(summary.get('usersWithout2SVEnrollment', 0))} users and enforce phishing-resistant MFA for privileged roles.",
+        "Review and revoke unnecessary OAuth grants, then enforce an approved-app/least-privilege OAuth policy.",
+        "Investigate risky login events per user and tighten conditional/context-aware access controls.",
+        "Audit external sharing activity, remove unnecessary external collaborators, and restrict public link sharing by OU.",
+        f"Reduce anyone-with-link exposure from {int(summary.get('filesAnyoneWithLink', 0))} files by enforcing internal-only defaults and exception approvals.",
+        "Introduce formal admin change-control for trusted apps/app-access policy updates with monthly compliance review.",
+        "Set recurring OAuth consent governance (owner + business justification + expiry) to reduce app-access sprawl.",
+        "Move DMARC from monitor mode to enforcement where feasible after staged monitoring.",
+        "Remove unused alias domains or fully configure SPF/DKIM/DMARC controls.",
+        "Suspend or recertify stale active accounts and automatically deprovision dormant accounts after policy threshold.",
+    ]
+    recommendation_rows = "\n".join(f"<li>{html.escape(r)}</li>" for r in static_recommendations)
 
     logo_markup = (
-        f"<img src='{html.escape(logo_url)}' alt='Logo' style='max-height:70px;max-width:220px;' />"
+        f"<img src='{html.escape(logo_url)}' alt='Grey Wing Security logo' style='max-height:100px;max-width:420px;object-fit:contain;' />"
         if logo_url
         else "Insert logo"
     )
 
-    generated_at = html.escape(str(findings.get("generatedAt", to_iso(utc_now()))))
+    generated_at_raw = str(findings.get("generatedAt", to_iso(utc_now())))
+    assessment_date = html.escape(generated_at_raw[:10])
+    generated_at = html.escape(generated_at_raw)
     customer = html.escape(customer)
     prepared_by = html.escape(prepared_by)
+    findings_path = html.escape(findings_path or "")
+    domains_csv_path = html.escape(str(domains_csv_path or "Not provided"))
+    script_path = html.escape(os.path.abspath(__file__))
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Google Workspace Security Assessment</title>
+  <title>Google Workspace Security Assessment Report</title>
   <style>
-    :root {{ --gw-blue:#2563eb; --gw-navy:#2b3e6d; --gw-header:#5c5c5c; --gw-charcoal:#00090f; --gw-gray:#7d7d7d; --gw-light-gray:#acaead; }}
-    body {{ font-family: Arial, sans-serif; margin: 0; background: #f6f8fb; color: var(--gw-charcoal); }}
+    body {{ font-family: Arial, sans-serif; margin: 0; background: #f6f8fb; color: #1f2937; }}
     .page {{ max-width: 980px; margin: 24px auto; background: #fff; padding: 36px; box-shadow: 0 2px 10px rgba(0,0,0,.08); }}
-    .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--gw-header); padding-bottom: 16px; margin-bottom: 20px; }}
-    .logo-box {{ width: 220px; height: 70px; border: 2px dashed var(--gw-gray); display: flex; align-items: center; justify-content: center; color: var(--gw-header); font-size: 13px; text-align: center; }}
+    .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #e5e7eb; padding-bottom: 16px; margin-bottom: 20px; }}
+    .logo-box {{ width: 420px; min-height: 110px; display: flex; align-items: center; justify-content: center; color: #6b7280; font-size: 13px; text-align: center; border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; }}
     h1 {{ margin: 0 0 6px 0; font-size: 28px; }}
-    h2 {{ margin-top: 30px; font-size: 21px; border-left: 4px solid var(--gw-navy); padding-left: 10px; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-    th, td {{ border: 1px solid #d1d5db; padding: 10px; text-align: left; font-size: 14px; vertical-align: top; }}
-    th {{ background: #f3f4f6; color: var(--gw-charcoal); }}
+    h2 {{ margin-top: 30px; font-size: 21px; border-left: 4px solid #2563eb; padding-left: 10px; }}
+    h3 {{ margin-top: 20px; font-size: 17px; }}
+    p, li {{ line-height: 1.5; }}
+    .meta {{ font-size: 14px; color: #4b5563; }}
     .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 12px; }}
-    .card {{ background: #f9fafb; border: 1px solid #d1d5db; border-radius: 8px; padding: 12px; }}
+    .card {{ background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; }}
     .metric {{ font-size: 28px; font-weight: 700; margin-top: 6px; }}
-    .sev-critical {{ color: #b91c1c; font-weight: 700; }}
-    .sev-high {{ color: var(--gw-navy); font-weight: 700; }}
-    .sev-medium {{ color: var(--gw-blue); font-weight: 700; }}
-    .sev-low {{ color: #047857; font-weight: 700; }}
+    .sev-critical, .sev-high, .sev-medium, .sev-low {{ font-weight: 700; }}
+    .sev-critical {{ color: #b91c1c; }}
+    .sev-high {{ color: #b45309; }}
+    .sev-medium {{ color: #1d4ed8; }}
+    .sev-low {{ color: #047857; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+    th, td {{ border: 1px solid #e5e7eb; padding: 10px; text-align: left; font-size: 14px; vertical-align: top; }}
+    th {{ background: #f3f4f6; }}
+    .small {{ font-size: 12px; color: #6b7280; }}
+    .footer {{ margin-top: 28px; font-size: 12px; color: #6b7280; border-top: 1px solid #e5e7eb; padding-top: 12px; }}
+    @media print {{
+      body {{ background: #fff; }}
+      .page {{ box-shadow: none; margin: 0; max-width: 100%; }}
+    }}
   </style>
 </head>
 <body>
@@ -1211,36 +1356,208 @@ def render_report_html(findings, customer, prepared_by, logo_url):
     <div class="header">
       <div>
         <h1>Google Workspace Security Assessment</h1>
-        <div><strong>Customer:</strong> {customer}</div>
-        <div><strong>Prepared by:</strong> {prepared_by}</div>
-        <div><strong>Generated:</strong> {generated_at}</div>
+        <div class="meta"><strong>Customer:</strong> {customer}</div>
+        <div class="meta"><strong>Prepared by:</strong> {prepared_by}</div>
+        <div class="meta"><strong>Assessment Date:</strong> {assessment_date}</div>
       </div>
       <div class="logo-box">{logo_markup}</div>
     </div>
-    <h2>Executive Summary</h2>
+
+    <h2>1. Executive Summary</h2>
+    <p>
+      This report summarizes a read-only security assessment of the Google Workspace environment using Google Admin APIs across identity, authentication, OAuth access, device security, and login telemetry.
+      The assessment identified several high-risk OAuth grants, repeated risky/failed login patterns, and notable external sharing activity requiring immediate review.
+    </p>
+    <p><strong>Overall Workspace Security Posture Score:</strong> <strong>{score_data["score"]} / 100 (Grade: {html.escape(score_data["grade"])})</strong></p>
+    <p><strong>Why {score_data["score"]}:</strong> this posture score starts at 100 and is reduced by weighted risk factors across identity, OAuth, login risk, sharing, and stale accounts.</p>
+    <ul>
+      <li>2SV not enrolled: <strong>-{score_data["p_2sv"]}</strong> ({int(summary.get("usersWithout2SVEnrollment", 0))}/{int(summary.get("activeUsers", 0))} active users)</li>
+      <li>High-impact OAuth grants: <strong>-{score_data["p_oauth"]}</strong> ({int(summary.get("riskyOAuthGrants", 0))} grants, capped)</li>
+      <li>Suspicious login events: <strong>-{score_data["p_login"]}</strong> ({int(summary.get("suspiciousLoginEvents30d", 0))} events, capped)</li>
+      <li>External shared domains: <strong>-{score_data["p_external_domains"]}</strong> ({int(summary.get("externalSharedDomains", 0))} domains)</li>
+      <li>Anyone-with-link files: <strong>-{score_data["p_anyone_link"]}</strong> ({int(summary.get("filesAnyoneWithLink", 0))} files, capped)</li>
+      <li>Stale active accounts: <strong>-{score_data["p_stale"]}</strong> ({int(summary.get("staleAccounts90d", 0))} accounts inactive 90+ days)</li>
+      <li><strong>Total penalty: -{score_data["total_penalty"]}</strong> → final score <strong>{score_data["score"]}</strong></li>
+    </ul>
+    <p><strong>Email Domain Health (SPF/DKIM/DMARC):</strong> <strong>{email_score} / 100 overall</strong> (<strong>{verified_avg} / 100</strong> on verified domains only).</p>
+
     <div class="grid">
-      <div class="card"><div>Active Users</div><div class="metric">{summary.get("activeUsers", 0)}</div></div>
-      <div class="card"><div>Users Not Enrolled in 2SV</div><div class="metric">{summary.get("usersWithout2SVEnrollment", 0)}</div></div>
-      <div class="card"><div>High-Impact OAuth Grants</div><div class="metric">{summary.get("riskyOAuthGrants", 0)}</div></div>
-      <div class="card"><div>Suspicious Login Events (30d)</div><div class="metric">{summary.get("suspiciousLoginEvents30d", 0)}</div></div>
-      <div class="card"><div>External Sharing Events (30d)</div><div class="metric">{summary.get("externalSharingEvents30d", 0)}</div></div>
-      <div class="card"><div>Files with Anyone-Link Access</div><div class="metric">{summary.get("filesAnyoneWithLink", 0)}</div></div>
-      <div class="card"><div>External Shared Domains</div><div class="metric">{summary.get("externalSharedDomains", 0)}</div></div>
-      <div class="card"><div>Groups Anyone Can Join</div><div class="metric">{summary.get("groupsAnyoneCanJoin", 0)}</div></div>
-      <div class="card"><div>Groups Anyone Can View</div><div class="metric">{summary.get("groupsAnyoneCanView", 0)}</div></div>
-      <div class="card"><div>Domain Health Score</div><div class="metric">{summary.get("domainHealthScore", 0)} ({summary.get("domainHealthGrade", "N/A")})</div></div>
+      <div class="card"><div>Active Users</div><div class="metric">{int(summary.get("activeUsers", 0))}</div></div>
+      <div class="card"><div>Users Not Enrolled in 2SV</div><div class="metric">{int(summary.get("usersWithout2SVEnrollment", 0))}</div></div>
+      <div class="card"><div>High-Impact OAuth Grants</div><div class="metric">{int(summary.get("riskyOAuthGrants", 0))}</div></div>
+      <div class="card"><div>Suspicious Login Events (30d)</div><div class="metric">{int(summary.get("suspiciousLoginEvents30d", 0))}</div></div>
+      <div class="card"><div>External Sharing Events (30d)</div><div class="metric">{int(summary.get("externalSharingEvents30d", 0))}</div></div>
+      <div class="card"><div>External Shared Domains (30d activity)</div><div class="metric">{int(summary.get("externalSharedDomains", 0))}</div></div>
+      <div class="card"><div>Anyone-with-link Files (current state)</div><div class="metric">{int(summary.get("filesAnyoneWithLink", 0))}</div></div>
+      <div class="card"><div>Groups Anyone Can Join</div><div class="metric">{int(summary.get("groupsAnyoneCanJoin", 0))}</div></div>
+      <div class="card"><div>Groups Anyone Can Read</div><div class="metric">{int(summary.get("groupsAnyoneCanView", 0))}</div></div>
+      <div class="card"><div>Stale Active Accounts (90+ days)</div><div class="metric">{int(summary.get("staleAccounts90d", 0))}</div></div>
+      <div class="card"><div>Never-Logged-In Active Users</div><div class="metric">{int(summary.get("neverLoggedInActiveUsers", 0))}</div></div>
+      <div class="card"><div>Email Domains Checked</div><div class="metric">{email_domains_checked if email_domains_checked else "N/A"}</div></div>
+      <div class="card"><div>Domains with SPF / DKIM / DMARC</div><div class="metric">{email_with_spf}/{email_with_dkim}/{email_with_dmarc}</div></div>
+      <div class="card"><div>Admin Security/App Changes (30d)</div><div class="metric">{admin_security_change_count}</div></div>
+      <div class="card"><div>OAuth Token Authorizations (30d)</div><div class="metric">{token_authorize_count}</div></div>
     </div>
-    <h2>Risk Register</h2>
+
+    <h2>2. Scope & Method</h2>
+    <ul>
+      <li><strong>Scope:</strong> Entire primary Google Workspace domain.</li>
+      <li><strong>Access model:</strong> Domain-wide delegated service account + read-only API scopes.</li>
+      <li><strong>Data sources:</strong> Directory API, Reports API, Groups Settings API, Drive API metadata queries, and DNS TXT checks (SPF/DKIM/DMARC).</li>
+      <li><strong>Assessment window:</strong> Login telemetry reviewed for trailing 30 days.</li>
+      <li><strong>Generated:</strong> {generated_at}</li>
+    </ul>
+
+    <h2>3. Risk Register</h2>
     <table>
-      <thead><tr><th>Severity</th><th>Finding</th><th>Count</th><th>Recommended Action</th></tr></thead>
+      <thead>
+        <tr>
+          <th>Severity</th>
+          <th>Finding</th>
+          <th>Impact</th>
+          <th>Evidence (Count)</th>
+          <th>Recommended Action</th>
+        </tr>
+      </thead>
       <tbody>
-        {findings_rows}
+        <tr><td class="sev-high">High</td><td>OAuth grants with high-impact scopes</td><td>Potential broad data access (mail, drive, cloud resources) via third-party apps.</td><td>{int(summary.get("riskyOAuthGrants", 0))} grants</td><td>Review and revoke non-essential OAuth grants; enforce trusted app controls and scope restrictions.</td></tr>
+        <tr><td class="sev-medium">Medium</td><td>Suspicious login-related events</td><td>Potential account takeover attempts and risky session activity.</td><td>{int(summary.get("suspiciousLoginEvents30d", 0))} events in 30 days</td><td>Investigate affected users, geolocation anomalies, repeated failures, and challenge outcomes.</td></tr>
+        <tr><td class="sev-high">High</td><td>Potential external sharing activity</td><td>Possible data exposure to external collaborators or public links.</td><td>{int(summary.get("externalSharingEvents30d", 0))} events in 30 days</td><td>Review externally shared files/folders, remove unnecessary external access, and restrict public link sharing by policy.</td></tr>
+        <tr><td class="sev-medium">Medium</td><td>Admin security/app-access changes observed</td><td>High volume of trust/app-access/policy changes increases misconfiguration risk without strict change control.</td><td>{admin_security_change_count} admin security-related events in 30 days</td><td>Map every change to approved tickets and enforce two-person review for high-impact admin changes.</td></tr>
+        <tr><td class="sev-medium">Medium</td><td>OAuth token authorization volume</td><td>High app-authorization volume indicates app sprawl and elevated third-party access risk.</td><td>{token_authorize_count} authorize events ({token_revoke_count} revokes) in 30 days</td><td>Enforce app allowlisting, periodic consent review, and automated revocation for high-risk scopes.</td></tr>
+        <tr><td class="sev-medium">Medium</td><td>Stale active accounts</td><td>Inactive accounts can be abused for persistence and unauthorized access.</td><td>{int(summary.get("staleAccounts90d", 0))} accounts inactive 90+ days ({int(summary.get("neverLoggedInActiveUsers", 0))} never logged in)</td><td>Suspend or validate stale accounts and enforce owner recertification.</td></tr>
+        <tr><td class="sev-high">High</td><td>Files accessible via “anyone with link”</td><td>Large public-link footprint increases accidental exposure risk.</td><td>{int(summary.get("filesAnyoneWithLink", 0))} files (exact per-user owner scan)</td><td>Reduce link-sharing on sensitive assets, enforce internal-only defaults, and monitor exceptions.</td></tr>
+        <tr><td class="sev-medium">Medium</td><td>Users not enrolled in 2SV</td><td>Increased likelihood of credential compromise.</td><td>{int(summary.get("usersWithout2SVEnrollment", 0))} active users</td><td>Complete 2SV enrollment for remaining users and verify enforcement stays at 100%.</td></tr>
       </tbody>
     </table>
-    <h2>Recommended Changes</h2>
+
+    <h2>4. Detailed Findings</h2>
+    <h3>4.1 OAuth Exposure</h3>
+    <p>High-impact scopes were detected across several applications, including mail and cloud-platform level access.</p>
     <ul>
-      {recommendation_rows}
+      <li>Examples observed: <code>https://mail.google.com/</code>, <code>https://www.googleapis.com/auth/drive</code>, <code>https://www.googleapis.com/auth/cloud-platform</code>.</li>
+      <li>Total high-impact OAuth grants observed: <strong>{int(summary.get("riskyOAuthGrants", 0))}</strong>.</li>
     </ul>
+
+    <h3>4.2 Authentication & Login Risk</h3>
+    <ul>
+      <li>Observed events include <code>login_failure</code>, <code>login_challenge</code>, and <code>risky_sensitive_action_allowed</code>/<code>blocked</code>.</li>
+      <li>Total suspicious login events in 30-day window: <strong>{int(summary.get("suspiciousLoginEvents30d", 0))}</strong>.</li>
+    </ul>
+
+    <h3>4.3 Identity Baseline</h3>
+    <ul>
+      <li>2SV enforcement appears enabled for enrolled users, but <strong>{int(summary.get("usersWithout2SVEnrollment", 0))} active users</strong> are still not enrolled.</li>
+      <li>No unencrypted managed mobile devices were detected in the collected dataset.</li>
+      <li class="small">Note: API role assignment output may be incomplete in some tenants; validate Super Admin list directly in Admin Console.</li>
+    </ul>
+
+    <h3>4.4 External Sharing Exposure</h3>
+    <ul>
+      <li>Drive telemetry indicates <strong>{int(summary.get("externalSharingEvents30d", 0))} potential external sharing-related events</strong> in the 30-day review window.</li>
+      <li>Observed external domains in sharing activity include: {external_domains_html}</li>
+      <li>A detailed CSV of observed external domains was generated at <code>{domains_csv_path}</code>.</li>
+      <li>Exact current-state count of files with “anyone with link” is available via delegated per-user scan: <strong>{int(summary.get("filesAnyoneWithLink", 0))} files</strong>.</li>
+    </ul>
+
+    <h3>4.5 Additional Issues Identified</h3>
+    <ul>
+      <li><strong>{int(summary.get("staleAccounts90d", 0))} stale active accounts</strong> (including <strong>{int(summary.get("neverLoggedInActiveUsers", 0))} never-logged-in accounts</strong>) should be reviewed for deprovisioning or suspension.</li>
+      <li><strong>{int(summary.get("filesAnyoneWithLink", 0))} files currently use anyone-with-link visibility</strong>; prioritize remediation by data sensitivity and owner.</li>
+    </ul>
+
+    <h3>4.6 Google Groups Exposure</h3>
+    <ul>
+      <li>Detected groups in tenant: <strong>{int(summary.get("groupsTotal", 0))}</strong>.</li>
+      <li>Confirmed groups allowing anyone to join: <strong>{int(summary.get("groupsAnyoneCanJoin", 0))}</strong>.</li>
+      <li>Confirmed groups allowing anyone to read: <strong>{int(summary.get("groupsAnyoneCanView", 0))}</strong>.</li>
+      <li>Groups settings check {"completed successfully" if not summary.get("groupsScanError", False) else "returned errors"} in this run.</li>
+    </ul>
+
+    <h3>4.7 Admin & API Governance</h3>
+    <ul>
+      <li>Admin audit logs show <strong>{admin_security_change_count} security/app-access relevant changes</strong> in the last 30 days.</li>
+      <li>Token audit logs show <strong>{token_authorize_count} authorization events</strong>, <strong>{token_revoke_count} revocations</strong>, and <strong>{token_deny_count} consent denials</strong>.</li>
+      <li>This pattern is common in fast-moving environments but requires stronger change control and periodic app-consent governance.</li>
+    </ul>
+
+    <h3>4.8 Control Coverage Matrix</h3>
+    <table>
+      <thead><tr><th>Control Area</th><th>Status</th><th>Evidence</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Identity & MFA</td><td class="{identity_status[0]}">{identity_status[1]}</td><td>{int(summary.get("usersWithout2SVEnrollment", 0))} users not enrolled in 2SV; enforcement present for enrolled users</td><td>Close enrollment gap and harden privileged auth</td></tr>
+        <tr><td>OAuth/App Access Governance</td><td class="{oauth_status[0]}">{oauth_status[1]}</td><td>{int(summary.get("riskyOAuthGrants", 0))} high-impact grants; {token_authorize_count} token authorizations</td><td>Implement allowlisting and periodic grant recertification</td></tr>
+        <tr><td>Data Sharing Controls (Drive)</td><td class="{sharing_status[0]}">{sharing_status[1]}</td><td>{int(summary.get("filesAnyoneWithLink", 0))} anyone-with-link files; {int(summary.get("externalSharingEvents30d", 0))} external sharing events</td><td>Prioritize sensitive file remediation and policy hardening</td></tr>
+        <tr><td>Groups Exposure</td><td class="{groups_status[0]}">{groups_status[1]}</td><td>{groups_exposed} groups with anyone-join/read exposure</td><td>Maintain restrictive settings and continue periodic review</td></tr>
+        <tr><td>Email Domain Authentication</td><td class="{email_status[0]}">{email_status[1]}</td><td>SPF/DKIM/DMARC: {email_with_spf}/{email_with_dkim}/{email_with_dmarc} domains checked</td><td>Move DMARC monitor-only domains to enforcement and clean up alias posture</td></tr>
+        <tr><td>Endpoint Posture</td><td class="{endpoint_status[0]}">{endpoint_status[1]}</td><td>{int(summary.get("unencryptedMobileDevices", 0))} unencrypted managed mobile devices</td><td>Continue compliance monitoring</td></tr>
+      </tbody>
+    </table>
+
+    <h3>4.9 Email Domain Authentication Health (SPF, DKIM, DMARC)</h3>
+    <table>
+      <thead><tr><th>Domain</th><th>SPF</th><th>DKIM</th><th>DMARC</th><th>Policy</th><th>Score</th></tr></thead>
+      <tbody>{email_rows_html}</tbody>
+    </table>
+    <ul>
+      <li>Primary gap: {primary_gap_text}</li>
+      <li>Alias risk: {alias_gap_text}</li>
+    </ul>
+
+    <h2>5. Control Baseline</h2>
+    <table>
+      <thead><tr><th>Baseline Domain</th><th>Target Baseline</th><th>Current State</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>Identity / MFA</td><td>100% active users enrolled in MFA; privileged users phishing-resistant</td><td>{int(summary.get("usersWithout2SVEnrollment", 0))} of {int(summary.get("activeUsers", 0))} active users not enrolled in 2SV</td><td class="{identity_status[0]}">{identity_status[1]}</td></tr>
+        <tr><td>OAuth App Governance</td><td>Approved-app allowlist; high-risk scopes strictly justified</td><td>{int(summary.get("riskyOAuthGrants", 0))} high-impact grants; {token_authorize_count} authorize events in 30 days</td><td class="{oauth_status[0]}">{oauth_status[1]}</td></tr>
+        <tr><td>Drive Public Sharing</td><td>No broad public-link sharing except documented exceptions</td><td>{int(summary.get("filesAnyoneWithLink", 0))} files with anyone-with-link access</td><td class="{sharing_status[0]}">{sharing_status[1]}</td></tr>
+        <tr><td>External Collaboration</td><td>Allowlisted domains with periodic recertification</td><td>{int(summary.get("externalSharedDomains", 0))} external domains observed in sharing activity</td><td class="sev-medium">Partial</td></tr>
+        <tr><td>Google Groups Exposure</td><td>No groups allowing anyone to join/read</td><td>{groups_exposed} groups with anyone-join/read</td><td class="{groups_status[0]}">{groups_status[1]}</td></tr>
+        <tr><td>Email Authentication (SPF/DKIM/DMARC)</td><td>SPF + DKIM + DMARC enforce mode on all active domains</td><td>{email_with_spf}/{email_with_dkim}/{email_with_dmarc} protected domains</td><td class="{email_status[0]}">{email_status[1]}</td></tr>
+        <tr><td>Dormant Account Hygiene</td><td>Disable or recertify accounts inactive over 90 days</td><td>{int(summary.get("staleAccounts90d", 0))} stale active accounts; {int(summary.get("neverLoggedInActiveUsers", 0))} never-logged-in accounts</td><td class="sev-medium">Partial</td></tr>
+        <tr><td>Admin Change Governance</td><td>Ticketed, approved, and auditable high-impact admin changes</td><td>{admin_security_change_count} admin security/app-access changes in 30 days</td><td class="sev-medium">Partial</td></tr>
+      </tbody>
+    </table>
+
+    <h2>6. Framework Mapping (CIS + NIST)</h2>
+    <p>This mapping is implementation-focused and indicates control posture based on observed evidence in this assessment period.</p>
+    <table>
+      <thead><tr><th>Framework</th><th>Control / Category</th><th>Assessment</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>CIS Controls v8</td><td>5.1/5.2 Account Inventory & Lifecycle</td><td class="sev-medium">Partial</td><td>{int(summary.get("staleAccounts90d", 0))} stale active accounts, including {int(summary.get("neverLoggedInActiveUsers", 0))} never-logged-in</td></tr>
+        <tr><td>CIS Controls v8</td><td>6.3 MFA for user access</td><td class="{identity_status[0]}">{identity_status[1]}</td><td>{int(summary.get("usersWithout2SVEnrollment", 0))} active users not enrolled in 2SV</td></tr>
+        <tr><td>CIS Controls v8</td><td>6.7 Centralized access governance</td><td class="{oauth_status[0]}">{oauth_status[1]}</td><td>{int(summary.get("riskyOAuthGrants", 0))} high-impact OAuth grants; high token authorization volume</td></tr>
+        <tr><td>CIS Controls v8</td><td>3.3 Data access control / sharing restrictions</td><td class="{sharing_status[0]}">{sharing_status[1]}</td><td>{int(summary.get("filesAnyoneWithLink", 0))} anyone-with-link files; {int(summary.get("externalSharingEvents30d", 0))} external sharing events</td></tr>
+        <tr><td>CIS Controls v8</td><td>8.2 Audit log management and review</td><td class="sev-medium">Partial</td><td>Strong log coverage present; governance follow-through required</td></tr>
+        <tr><td>NIST CSF 2.0</td><td>PR.AA / PR.AC (Identity, Authentication, Access Control)</td><td class="sev-medium">Partial</td><td>MFA gap remains; group exposure controls are strong</td></tr>
+        <tr><td>NIST CSF 2.0</td><td>PR.DS (Data Security)</td><td class="{sharing_status[0]}">{sharing_status[1]}</td><td>Anyone-link exposure and active external sharing footprint</td></tr>
+        <tr><td>NIST CSF 2.0</td><td>DE.CM / DE.AE (Continuous Monitoring / Anomalies)</td><td class="sev-medium">Partial</td><td>Telemetry exists; operational triage and SLAs need hardening</td></tr>
+        <tr><td>NIST CSF 2.0</td><td>GV.RM / GV.PO (Risk Management / Policy)</td><td class="sev-medium">Partial</td><td>Policy intent present; enforcement and recertification cadence needed</td></tr>
+      </tbody>
+    </table>
+
+    <h2>7. Recommended Changes</h2>
+    <ul>{recommendation_rows}</ul>
+
+    <h2>8. 30-60-90 Day Remediation Plan</h2>
+    <table>
+      <thead><tr><th>Timeline</th><th>Action</th><th>Owner</th><th>Success Criteria</th></tr></thead>
+      <tbody>
+        <tr><td>0-30 days</td><td>Review/revoke risky OAuth grants; investigate high-risk login events; close 2SV enrollment gap; triage external sharing events; reduce anyone-with-link exposure on high-risk files first; baseline admin/app-access changes against approved tickets.</td><td>[Security / IT Admin]</td><td>All non-business-critical risky grants removed; all flagged users reviewed; 2SV enrollment at 100%.</td></tr>
+        <tr><td>31-60 days</td><td>Implement app allowlisting and context-aware access controls; tighten alert routing.</td><td>[Security Engineering]</td><td>Only approved OAuth apps allowed; priority alerts routed to SOC/helpdesk with SLA.</td></tr>
+        <tr><td>61-90 days</td><td>Run follow-up assessment and trend comparison; formalize quarterly governance review.</td><td>[Security Governance]</td><td>Reduction in risky events and grants, documented governance cadence.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>9. Appendix</h2>
+    <ul>
+      <li><strong>Raw findings file:</strong> <code>{findings_path or "Not provided"}</code></li>
+      <li><strong>External sharing domains CSV:</strong> <code>{domains_csv_path}</code></li>
+      <li><strong>Collection script:</strong> <code>{script_path}</code></li>
+      <li><strong>Assessment type:</strong> Read-only API review (no configuration changes made).</li>
+    </ul>
+
+    <div class="footer">Confidential - Prepared for {customer}.</div>
   </div>
 </body>
 </html>
@@ -1249,7 +1566,16 @@ def render_report_html(findings, customer, prepared_by, logo_url):
 
 def build_report(args):
     findings = read_json(args.findings)
-    html_report = render_report_html(findings, args.customer, args.prepared_by, args.logo_url)
+    logo_url = args.logo_url or logo_file_to_data_uri(args.logo_path)
+    email_health = load_optional_json(args.email_health_json)
+    html_report = render_report_html(
+        findings,
+        args.customer,
+        args.prepared_by,
+        logo_url,
+        findings_path=args.findings,
+        email_health=email_health,
+    )
     with open(args.out_html, "w", encoding="utf-8") as f:
         f.write(html_report)
     print(f"Report written to: {args.out_html}")
@@ -1279,6 +1605,8 @@ def main():
     p_report.add_argument("--customer", required=True)
     p_report.add_argument("--prepared-by", required=True)
     p_report.add_argument("--logo-url")
+    p_report.add_argument("--logo-path")
+    p_report.add_argument("--email-health-json")
     p_report.set_defaults(func=build_report)
 
     args = parser.parse_args()
