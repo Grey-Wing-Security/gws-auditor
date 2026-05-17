@@ -95,6 +95,19 @@ LOGO_MIME_BY_EXT = {
     ".svg": "image/svg+xml",
 }
 
+GRADE_THRESHOLDS = (
+    (90, "A"),
+    (80, "B"),
+    (70, "C"),
+    (60, "D"),
+)
+
+
+def score_grade(score):
+    for min_score, grade in GRADE_THRESHOLDS:
+        if score >= min_score:
+            return grade
+    return "F"
 REPORTS_ACTIVITY_BASE_URL = "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications"
 REPORTS_ACTIVITY_PAGE_SIZE = 1000
 
@@ -372,32 +385,60 @@ def parse_login_time(raw):
         return None
 
 
-def calculate_domain_health(summary):
+def domain_health_penalties(summary):
     active = max(1, int(summary.get("activeUsers", 0)))
-    score = 100.0
-    score -= (summary.get("usersWithout2SVEnrollment", 0) / active) * 25
-    score -= (summary.get("usersWithout2SVEnforcement", 0) / active) * 15
-    score -= min(20.0, (summary.get("riskyOAuthGrants", 0) / active) * 20)
-    score -= min(10.0, (summary.get("suspiciousLoginEvents30d", 0) / active) * 6)
-    score -= min(12.0, summary.get("filesAnyoneWithLink", 0) * 0.25)
-    score -= min(12.0, summary.get("filesPublicOnWeb", 0) * 1.5)
-    score -= min(8.0, summary.get("externalSharedDomains", 0) * 0.5)
-    score -= min(10.0, summary.get("groupsAnyoneCanJoin", 0) * 2.0)
-    score -= min(10.0, summary.get("groupsAnyoneCanView", 0) * 2.0)
-    score -= min(8.0, (summary.get("staleAccounts90d", 0) / active) * 20)
-    score -= min(5.0, summary.get("unencryptedMobileDevices", 0) * 1.0)
-    score = max(0, min(100, round(score, 1)))
-    if score >= 90:
-        grade = "A"
-    elif score >= 80:
-        grade = "B"
-    elif score >= 70:
-        grade = "C"
-    elif score >= 60:
-        grade = "D"
-    else:
-        grade = "F"
-    return score, grade
+    return {
+        "p_2sv_enrollment": (summary.get("usersWithout2SVEnrollment", 0) / active) * 25,
+        "p_2sv_enforcement": (summary.get("usersWithout2SVEnforcement", 0) / active) * 15,
+        "p_oauth": min(20.0, (summary.get("riskyOAuthGrants", 0) / active) * 20),
+        "p_login": min(10.0, (summary.get("suspiciousLoginEvents30d", 0) / active) * 6),
+        "p_anyone_link": min(12.0, summary.get("filesAnyoneWithLink", 0) * 0.25),
+        "p_public_on_web": min(12.0, summary.get("filesPublicOnWeb", 0) * 1.5),
+        "p_external_domains": min(8.0, summary.get("externalSharedDomains", 0) * 0.5),
+        "p_groups_anyone_join": min(10.0, summary.get("groupsAnyoneCanJoin", 0) * 2.0),
+        "p_groups_anyone_view": min(10.0, summary.get("groupsAnyoneCanView", 0) * 2.0),
+        "p_stale": min(8.0, (summary.get("staleAccounts90d", 0) / active) * 20),
+        "p_unencrypted_mobile": min(5.0, summary.get("unencryptedMobileDevices", 0) * 1.0),
+    }
+
+
+def calculate_domain_health(summary):
+    score = max(0, min(100, round(100.0 - sum(domain_health_penalties(summary).values()), 1)))
+    return score, score_grade(score)
+
+
+def compute_posture_breakdown(summary):
+    penalties = {k: round(v, 1) for k, v in domain_health_penalties(summary).items()}
+    p_2sv_enrollment = penalties["p_2sv_enrollment"]
+    p_2sv_enforcement = penalties["p_2sv_enforcement"]
+    p_oauth = penalties["p_oauth"]
+    p_login = penalties["p_login"]
+    p_anyone_link = penalties["p_anyone_link"]
+    p_public_on_web = penalties["p_public_on_web"]
+    p_external_domains = penalties["p_external_domains"]
+    p_groups_anyone_join = penalties["p_groups_anyone_join"]
+    p_groups_anyone_view = penalties["p_groups_anyone_view"]
+    p_stale = penalties["p_stale"]
+    p_unencrypted_mobile = penalties["p_unencrypted_mobile"]
+    score, grade = calculate_domain_health(summary)
+    total_penalty = round(100.0 - score, 1)
+    return {
+        "score": score,
+        "grade": grade,
+        "p_2sv": p_2sv_enrollment,
+        "p_2sv_enrollment": p_2sv_enrollment,
+        "p_2sv_enforcement": p_2sv_enforcement,
+        "p_oauth": p_oauth,
+        "p_login": p_login,
+        "p_external_domains": p_external_domains,
+        "p_anyone_link": p_anyone_link,
+        "p_public_on_web": p_public_on_web,
+        "p_groups_anyone_join": p_groups_anyone_join,
+        "p_groups_anyone_view": p_groups_anyone_view,
+        "p_stale": p_stale,
+        "p_unencrypted_mobile": p_unencrypted_mobile,
+        "total_penalty": total_penalty,
+    }
 
 
 def write_domains_csv(path, domain_rows):
@@ -1182,42 +1223,6 @@ def load_optional_json(path):
         return None
 
 
-def score_grade(score):
-    if score >= 90:
-        return "A"
-    if score >= 80:
-        return "B"
-    if score >= 70:
-        return "C"
-    if score >= 60:
-        return "D"
-    return "F"
-
-
-def compute_posture_breakdown(summary):
-    p_2sv = round(min(20.0, float(summary.get("usersWithout2SVEnrollment", 0)) * 1.0), 1)
-    p_oauth = round(min(20.0, float(summary.get("riskyOAuthGrants", 0)) * 0.9), 1)
-    p_login = round(min(10.0, float(summary.get("suspiciousLoginEvents30d", 0)) * 0.25), 1)
-    p_external_domains = round(min(10.0, float(summary.get("externalSharedDomains", 0)) * 0.5), 1)
-    p_anyone_link = round(min(12.0, float(summary.get("filesAnyoneWithLink", 0)) * 0.02), 1)
-    p_stale = round(min(12.0, float(summary.get("staleAccounts90d", 0)) * 0.8), 1)
-    total = round(p_2sv + p_oauth + p_login + p_external_domains + p_anyone_link + p_stale, 1)
-    fallback_score = round(max(0.0, 100.0 - total), 1)
-    score = float(summary.get("domainHealthScore", fallback_score))
-    grade = str(summary.get("domainHealthGrade", score_grade(score)))
-    return {
-        "score": score,
-        "grade": grade,
-        "p_2sv": p_2sv,
-        "p_oauth": p_oauth,
-        "p_login": p_login,
-        "p_external_domains": p_external_domains,
-        "p_anyone_link": p_anyone_link,
-        "p_stale": p_stale,
-        "total_penalty": total,
-    }
-
-
 def render_report_html(findings, customer, prepared_by, logo_url, findings_path="", email_health=None):
     summary = findings.get("summary", {})
     observations = findings.get("observations", {})
@@ -1367,12 +1372,17 @@ def render_report_html(findings, customer, prepared_by, logo_url, findings_path=
     <p><strong>Overall Workspace Security Posture Score:</strong> <strong>{score_data["score"]} / 100 (Grade: {html.escape(score_data["grade"])})</strong></p>
     <p><strong>Why {score_data["score"]}:</strong> this posture score starts at 100 and is reduced by weighted risk factors across identity, OAuth, login risk, sharing, and stale accounts.</p>
     <ul>
-      <li>2SV not enrolled: <strong>-{score_data["p_2sv"]}</strong> ({int(summary.get("usersWithout2SVEnrollment", 0))}/{int(summary.get("activeUsers", 0))} active users)</li>
+      <li>2SV not enrolled: <strong>-{score_data["p_2sv_enrollment"]}</strong> ({int(summary.get("usersWithout2SVEnrollment", 0))}/{int(summary.get("activeUsers", 0))} active users)</li>
+      <li>2SV not enforced: <strong>-{score_data["p_2sv_enforcement"]}</strong> ({int(summary.get("usersWithout2SVEnforcement", 0))}/{int(summary.get("activeUsers", 0))} active users)</li>
       <li>High-impact OAuth grants: <strong>-{score_data["p_oauth"]}</strong> ({int(summary.get("riskyOAuthGrants", 0))} grants, capped)</li>
       <li>Suspicious login events: <strong>-{score_data["p_login"]}</strong> ({int(summary.get("suspiciousLoginEvents30d", 0))} events, capped)</li>
       <li>External shared domains: <strong>-{score_data["p_external_domains"]}</strong> ({int(summary.get("externalSharedDomains", 0))} domains)</li>
       <li>Anyone-with-link files: <strong>-{score_data["p_anyone_link"]}</strong> ({int(summary.get("filesAnyoneWithLink", 0))} files, capped)</li>
+      <li>Public-on-web files: <strong>-{score_data["p_public_on_web"]}</strong> ({int(summary.get("filesPublicOnWeb", 0))} files, capped)</li>
+      <li>Groups anyone can join: <strong>-{score_data["p_groups_anyone_join"]}</strong> ({int(summary.get("groupsAnyoneCanJoin", 0))} groups, capped)</li>
+      <li>Groups anyone can view: <strong>-{score_data["p_groups_anyone_view"]}</strong> ({int(summary.get("groupsAnyoneCanView", 0))} groups, capped)</li>
       <li>Stale active accounts: <strong>-{score_data["p_stale"]}</strong> ({int(summary.get("staleAccounts90d", 0))} accounts inactive 90+ days)</li>
+      <li>Unencrypted mobile devices: <strong>-{score_data["p_unencrypted_mobile"]}</strong> ({int(summary.get("unencryptedMobileDevices", 0))} devices, capped)</li>
       <li><strong>Total penalty: -{score_data["total_penalty"]}</strong> → final score <strong>{score_data["score"]}</strong></li>
     </ul>
     <p><strong>Email Domain Health (SPF/DKIM/DMARC):</strong> <strong>{email_score} / 100 overall</strong> (<strong>{verified_avg} / 100</strong> on verified domains only).</p>
