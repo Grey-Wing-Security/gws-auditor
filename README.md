@@ -11,7 +11,7 @@ Read-only security assessment tooling for Google Workspace domains.
   - Drive sharing posture (including anyone-with-link state via delegated per-user scan)
   - Google Groups exposure checks (anyone can join/read)
   - Mobile encryption posture
-  - JSON findings + branded HTML report generation
+  - JSON findings + branded HTML/PDF report generation
 - `email_domain_check.py`
   - DNS-based SPF / DKIM / DMARC posture scoring for Workspace domains
 
@@ -79,6 +79,17 @@ python workspace_audit.py build-report \
   --logo-url "https://example.com/logo.png"
 ```
 
+Build PDF directly (without creating HTML first):
+
+```bash
+python workspace_audit.py build-pdf \
+  --findings ./findings.json \
+  --out-pdf ./Google_Admin_Security_Report.pdf \
+  --customer "Customer Name" \
+  --prepared-by "Your Company" \
+  --logo-path /path/to/logo.png
+```
+
 ## Email auth domain health (SPF/DKIM/DMARC)
 
 With OAuth token:
@@ -101,6 +112,7 @@ python email_domain_check.py \
 - Findings JSON (`--out`)
 - External sharing domains CSV (`--domains-csv`)
 - Report HTML (`build-report --out-html`)
+- Report PDF (`build-pdf --out-pdf`)
 - Email auth health JSON (`email_domain_check.py --output`)
 
 ## Security notes
