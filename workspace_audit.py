@@ -486,7 +486,7 @@ def is_external_sharing_event(event):
     return has_context and has_external_signal
 
 
-def build_findings(access_token, domains_csv_path=None, service_account_key=None):
+def collect_user_inventory(access_token):
     users = paged_get(
         "https://admin.googleapis.com/admin/directory/v1/users",
         "users",
@@ -496,17 +496,8 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
     active_users = [u for u in users if not u.get("suspended", False)]
     user_by_id = {u.get("id"): u.get("primaryEmail") for u in users if u.get("id")}
     internal_domains = safe_internal_domains(access_token, users)
-
-    no_2sv_enrolled = [
-        u.get("primaryEmail")
-        for u in active_users
-        if not u.get("isEnrolledIn2Sv", False)
-    ]
-    no_2sv_enforced = [
-        u.get("primaryEmail")
-        for u in active_users
-        if not u.get("isEnforcedIn2Sv", False)
-    ]
+    no_2sv_enrolled = [u.get("primaryEmail") for u in active_users if not u.get("isEnrolledIn2Sv", False)]
+    no_2sv_enforced = [u.get("primaryEmail") for u in active_users if not u.get("isEnforcedIn2Sv", False)]
 
     stale_cutoff = utc_now() - dt.timedelta(days=90)
     stale_active_users = []
@@ -523,6 +514,19 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
         if last_login < stale_cutoff:
             stale_active_users.append(email)
 
+    return {
+        "users": users,
+        "active_users": active_users,
+        "user_by_id": user_by_id,
+        "internal_domains": internal_domains,
+        "no_2sv_enrolled": no_2sv_enrolled,
+        "no_2sv_enforced": no_2sv_enforced,
+        "stale_active_users": stale_active_users,
+        "never_logged_in_users": never_logged_in_users,
+    }
+
+
+def collect_super_admins(access_token, user_by_id, active_users):
     roles = paged_get(
         "https://admin.googleapis.com/admin/directory/v1/customer/my_customer/roles",
         "items",
@@ -530,7 +534,6 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
         {"maxResults": 100},
     )
     super_admin_role_ids = {str(r.get("roleId")) for r in roles if r.get("roleName") == "Super Admin"}
-
     role_assignments = paged_get(
         "https://admin.googleapis.com/admin/directory/v1/customer/my_customer/roleassignments",
         "items",
@@ -542,18 +545,19 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
         for a in role_assignments
         if str(a.get("roleId")) in super_admin_role_ids and a.get("assignedTo")
     }
-    super_admin_emails = sorted(
-        {user_by_id.get(uid) for uid in super_admin_user_ids if user_by_id.get(uid)}
-    )
+    super_admin_emails = sorted({user_by_id.get(uid) for uid in super_admin_user_ids if user_by_id.get(uid)})
     super_admin_without_2sv = [
         email
         for email in super_admin_emails
-        if any(
-            u.get("primaryEmail") == email and not u.get("isEnforcedIn2Sv", False)
-            for u in active_users
-        )
+        if any(u.get("primaryEmail") == email and not u.get("isEnforcedIn2Sv", False) for u in active_users)
     ]
+    return {
+        "super_admin_emails": super_admin_emails,
+        "super_admin_without_2sv": super_admin_without_2sv,
+    }
 
+
+def collect_risky_tokens(access_token, active_users):
     risky_tokens = []
     for u in active_users:
         email = u.get("primaryEmail")
@@ -573,8 +577,10 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                         "scopes": scopes,
                     }
                 )
+    return risky_tokens
 
-    start_time = to_iso(utc_now() - dt.timedelta(days=30))
+
+def collect_login_observations(access_token, start_time):
     login_activities = paged_report_activities("login", access_token, start_time)
     suspicious_logins = []
     event_counts = {}
@@ -591,42 +597,37 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                         "event": ev.get("name"),
                     }
                 )
+    return {"suspicious_logins": suspicious_logins, "event_counts": event_counts}
 
-    admin_activities = []
-    token_activities = []
-    groups_activities = []
-    try:
-        admin_activities = paged_report_activities("admin", access_token, start_time)
-    except Exception:
-        admin_activities = []
-    try:
-        token_activities = paged_report_activities("token", access_token, start_time)
-    except Exception:
-        token_activities = []
-    try:
-        groups_activities = paged_report_activities("groups", access_token, start_time)
-    except Exception:
-        groups_activities = []
 
-    admin_event_counts = Counter()
-    token_event_counts = Counter()
-    groups_event_counts = Counter()
-    for a in admin_activities:
-        for ev in a.get("events", []):
-            admin_event_counts[(ev.get("name") or "unknown")] += 1
-    for a in token_activities:
-        for ev in a.get("events", []):
-            token_event_counts[(ev.get("name") or "unknown")] += 1
-    for a in groups_activities:
-        for ev in a.get("events", []):
-            groups_event_counts[(ev.get("name") or "unknown")] += 1
-
-    drive_activities = []
+def safe_collect_activity(access_token, start_time, app):
     try:
-        drive_activities = paged_report_activities("drive", access_token, start_time)
+        return paged_report_activities(app, access_token, start_time)
     except Exception:
-        drive_activities = []
+        return []
 
+
+def collect_event_counts(activities):
+    counts = Counter()
+    for activity in activities:
+        for ev in activity.get("events", []):
+            counts[(ev.get("name") or "unknown")] += 1
+    return counts
+
+
+def collect_admin_token_groups_observations(access_token, start_time):
+    admin_activities = safe_collect_activity(access_token, start_time, "admin")
+    token_activities = safe_collect_activity(access_token, start_time, "token")
+    groups_activities = safe_collect_activity(access_token, start_time, "groups")
+    return {
+        "admin_event_counts": collect_event_counts(admin_activities),
+        "token_event_counts": collect_event_counts(token_activities),
+        "groups_event_counts": collect_event_counts(groups_activities),
+    }
+
+
+def collect_drive_activity_observations(access_token, start_time, internal_domains):
+    drive_activities = safe_collect_activity(access_token, start_time, "drive")
     external_sharing_events = []
     external_sharing_counts = {}
     external_domains_from_events = {}
@@ -640,18 +641,16 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
             all_vals_l = [v.lower() for v in event_parameter_values(ev)]
             combined = " ".join([ev_name_l] + all_vals_l)
             param_pairs = list(event_parameter_items(ev))
-
             file_ids = set()
             file_names = set()
+
             for p_name, vals in param_pairs:
                 if any(k in p_name for k in ("doc_id", "file_id", "item_id", "target_id", "resource_id")):
                     file_ids.update(v for v in vals if v)
                 if any(k in p_name for k in ("doc_title", "file_title", "doc_name", "file_name", "title", "name")):
                     file_names.update(v for v in vals if v)
-
                 is_domain_context_param = any(
-                    k in p_name
-                    for k in ("domain", "recipient", "shared_with", "target_user", "email", "owner", "external")
+                    k in p_name for k in ("domain", "recipient", "shared_with", "target_user", "email", "owner", "external")
                 )
                 for v in vals:
                     d = ""
@@ -665,7 +664,6 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
             if ("anyone" in combined and "link" in combined) or "shared_publicly" in combined:
                 anyone_link_file_ids_from_events.update(file_ids)
                 anyone_link_file_names_from_events.update(file_names)
-
             if is_external_sharing_event(ev):
                 external_sharing_counts[ev_name] = external_sharing_counts.get(ev_name, 0) + 1
                 external_sharing_events.append(
@@ -677,6 +675,16 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                     }
                 )
 
+    return {
+        "external_sharing_events": external_sharing_events,
+        "external_sharing_counts": external_sharing_counts,
+        "external_domains_from_events": external_domains_from_events,
+        "anyone_link_file_ids_from_events": anyone_link_file_ids_from_events,
+        "anyone_link_file_names_from_events": anyone_link_file_names_from_events,
+    }
+
+
+def collect_drive_inventory(access_token, internal_domains, external_domains_from_events, domains_csv_path):
     domain_drive_files, drive_scan_error, drive_scan_truncated = safe_domain_drive_files(access_token)
     anyone_link_files = []
     public_web_files = []
@@ -753,6 +761,17 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
     if domains_csv_path:
         write_domains_csv(domains_csv_path, domain_rows)
 
+    return {
+        "domain_drive_files": domain_drive_files,
+        "drive_scan_error": drive_scan_error,
+        "drive_scan_truncated": drive_scan_truncated,
+        "anyone_link_files": anyone_link_files,
+        "public_web_files": public_web_files,
+        "domain_rows": domain_rows,
+    }
+
+
+def collect_groups_exposure(access_token):
     groups, groups_scan_error = safe_list_groups(access_token)
     groups_anyone_can_join = []
     groups_anyone_can_view = []
@@ -785,7 +804,16 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                     "whoCanViewGroup": settings.get("whoCanViewGroup"),
                 }
             )
+    return {
+        "groups": groups,
+        "groups_scan_error": groups_scan_error,
+        "groups_anyone_can_join": groups_anyone_can_join,
+        "groups_anyone_can_view": groups_anyone_can_view,
+        "groups_settings_errors": groups_settings_errors,
+    }
 
+
+def collect_user_owner_drive_scan(service_account_key, active_users):
     user_owner_users_scanned = 0
     user_owner_scan_errors = []
     user_owner_anyone_link_map = {}
@@ -818,12 +846,23 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                     user_owner_public_web_map[fid or f"{email}:{f.get('name','')}"] = rec
             except Exception as e:
                 user_owner_scan_errors.append({"user": email, "error": str(e)[:400]})
+    return {
+        "user_owner_users_scanned": user_owner_users_scanned,
+        "user_owner_scan_errors": user_owner_scan_errors,
+        "user_owner_anyone_link_files": list(user_owner_anyone_link_map.values()),
+        "user_owner_public_web_files": list(user_owner_public_web_map.values()),
+    }
 
-    user_owner_anyone_link_files = list(user_owner_anyone_link_map.values())
-    user_owner_public_web_files = list(user_owner_public_web_map.values())
-    anyone_link_owner_counts = Counter((x.get("owner") or "unknown") for x in user_owner_anyone_link_files)
-    public_web_owner_counts = Counter((x.get("owner") or "unknown") for x in user_owner_public_web_files)
 
+def resolve_anyone_link_evidence(
+    domain_drive_files,
+    drive_scan_error,
+    anyone_link_files,
+    user_owner_anyone_link_files,
+    anyone_link_file_ids_from_events,
+    anyone_link_file_names_from_events,
+    user_owner_users_scanned,
+):
     anyone_link_files_count = len(anyone_link_files)
     anyone_link_evidence = anyone_link_files[:200]
     anyone_link_source = "drive_inventory" if len(domain_drive_files) > 0 else "unavailable"
@@ -833,19 +872,29 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
         anyone_link_source = "user_owner_scan_dwd"
     if anyone_link_files_count == 0 and anyone_link_file_ids_from_events:
         anyone_link_files_count = len(anyone_link_file_ids_from_events)
-        anyone_link_evidence = [
-            {"id": fid, "name": ""} for fid in list(anyone_link_file_ids_from_events)[:200]
-        ]
+        anyone_link_evidence = [{"id": fid, "name": ""} for fid in list(anyone_link_file_ids_from_events)[:200]]
         if not anyone_link_evidence and anyone_link_file_names_from_events:
-            anyone_link_evidence = [
-                {"id": "", "name": n} for n in list(anyone_link_file_names_from_events)[:200]
-            ]
+            anyone_link_evidence = [{"id": "", "name": n} for n in list(anyone_link_file_names_from_events)[:200]]
         anyone_link_source = "drive_activity_events"
     if user_owner_users_scanned > 0 and anyone_link_source == "unavailable":
         anyone_link_source = "user_owner_scan_dwd"
-    if len(public_web_files) == 0 and user_owner_public_web_files:
-        public_web_files = user_owner_public_web_files
 
+    anyone_title = "Files accessible via 'Anyone with the link'"
+    anyone_remediation = "Remove public link access for non-public assets and enforce safer default sharing settings."
+    if drive_scan_error and len(domain_drive_files) == 0:
+        anyone_title = "Files observed with 'Anyone with the link' access (activity-based, 30 days)"
+        anyone_remediation = "Enable Drive API for exact inventory, then remove unnecessary anyone-link exposure."
+
+    return {
+        "anyone_link_files_count": anyone_link_files_count,
+        "anyone_link_evidence": anyone_link_evidence,
+        "anyone_link_source": anyone_link_source,
+        "anyone_title": anyone_title,
+        "anyone_remediation": anyone_remediation,
+    }
+
+
+def collect_mobile_device_observations(access_token):
     mobile_devices = paged_get(
         "https://admin.googleapis.com/admin/directory/v1/customer/my_customer/devices/mobile",
         "mobiledevices",
@@ -864,7 +913,32 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                     "status": d.get("encryptionStatus"),
                 }
             )
+    return {"mobile_devices": mobile_devices, "unencrypted_mobile_devices": unencrypted_mobile_devices}
 
+
+def build_findings_list(
+    super_admin_without_2sv,
+    no_2sv_enforced,
+    risky_tokens,
+    suspicious_logins,
+    external_sharing_events,
+    anyone_link_files_count,
+    anyone_link_evidence,
+    anyone_title,
+    anyone_remediation,
+    public_web_files,
+    domain_rows,
+    admin_event_counts,
+    token_event_counts,
+    groups_anyone_can_join,
+    groups_anyone_can_view,
+    stale_active_users,
+    drive_scan_error,
+    user_owner_scan_errors,
+    groups_scan_error,
+    groups_settings_errors,
+    unencrypted_mobile_devices,
+):
     findings = []
     if super_admin_without_2sv:
         findings.append(
@@ -917,11 +991,6 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
             }
         )
     if anyone_link_files_count:
-        anyone_title = "Files accessible via 'Anyone with the link'"
-        anyone_remediation = "Remove public link access for non-public assets and enforce safer default sharing settings."
-        if drive_scan_error and len(domain_drive_files) == 0:
-            anyone_title = "Files observed with 'Anyone with the link' access (activity-based, 30 days)"
-            anyone_remediation = "Enable Drive API for exact inventory, then remove unnecessary anyone-link exposure."
         findings.append(
             {
                 "severity": "high",
@@ -1062,6 +1131,120 @@ def build_findings(access_token, domains_csv_path=None, service_account_key=None
                 "remediation": "Enforce encryption and block access from non-compliant devices.",
             }
         )
+    return findings
+
+
+def build_findings(access_token, domains_csv_path=None, service_account_key=None):
+    inventory = collect_user_inventory(access_token)
+    users = inventory["users"]
+    active_users = inventory["active_users"]
+    user_by_id = inventory["user_by_id"]
+    internal_domains = inventory["internal_domains"]
+    no_2sv_enrolled = inventory["no_2sv_enrolled"]
+    no_2sv_enforced = inventory["no_2sv_enforced"]
+    stale_active_users = inventory["stale_active_users"]
+    never_logged_in_users = inventory["never_logged_in_users"]
+
+    super_admin_data = collect_super_admins(access_token, user_by_id, active_users)
+    super_admin_emails = super_admin_data["super_admin_emails"]
+    super_admin_without_2sv = super_admin_data["super_admin_without_2sv"]
+
+    risky_tokens = collect_risky_tokens(access_token, active_users)
+    start_time = to_iso(utc_now() - dt.timedelta(days=30))
+    login_data = collect_login_observations(access_token, start_time)
+    suspicious_logins = login_data["suspicious_logins"]
+    event_counts = login_data["event_counts"]
+
+    atg_data = collect_admin_token_groups_observations(access_token, start_time)
+    admin_event_counts = atg_data["admin_event_counts"]
+    token_event_counts = atg_data["token_event_counts"]
+    groups_event_counts = atg_data["groups_event_counts"]
+
+    drive_activity = collect_drive_activity_observations(access_token, start_time, internal_domains)
+    external_sharing_events = drive_activity["external_sharing_events"]
+    external_sharing_counts = drive_activity["external_sharing_counts"]
+    external_domains_from_events = drive_activity["external_domains_from_events"]
+    anyone_link_file_ids_from_events = drive_activity["anyone_link_file_ids_from_events"]
+    anyone_link_file_names_from_events = drive_activity["anyone_link_file_names_from_events"]
+
+    drive_inventory = collect_drive_inventory(access_token, internal_domains, external_domains_from_events, domains_csv_path)
+    domain_drive_files = drive_inventory["domain_drive_files"]
+    drive_scan_error = drive_inventory["drive_scan_error"]
+    drive_scan_truncated = drive_inventory["drive_scan_truncated"]
+    anyone_link_files = drive_inventory["anyone_link_files"]
+    public_web_files = drive_inventory["public_web_files"]
+    domain_rows = drive_inventory["domain_rows"]
+
+    groups_data = collect_groups_exposure(access_token)
+    groups = groups_data["groups"]
+    groups_scan_error = groups_data["groups_scan_error"]
+    groups_anyone_can_join = groups_data["groups_anyone_can_join"]
+    groups_anyone_can_view = groups_data["groups_anyone_can_view"]
+    groups_settings_errors = groups_data["groups_settings_errors"]
+
+    owner_scan = collect_user_owner_drive_scan(service_account_key, active_users)
+    user_owner_users_scanned = owner_scan["user_owner_users_scanned"]
+    user_owner_scan_errors = owner_scan["user_owner_scan_errors"]
+    user_owner_anyone_link_files = owner_scan["user_owner_anyone_link_files"]
+    user_owner_public_web_files = owner_scan["user_owner_public_web_files"]
+    anyone_link_owner_counts = Counter((x.get("owner") or "unknown") for x in user_owner_anyone_link_files)
+    public_web_owner_counts = Counter((x.get("owner") or "unknown") for x in user_owner_public_web_files)
+
+    anyone_link_data = resolve_anyone_link_evidence(
+        domain_drive_files,
+        drive_scan_error,
+        anyone_link_files,
+        user_owner_anyone_link_files,
+        anyone_link_file_ids_from_events,
+        anyone_link_file_names_from_events,
+        user_owner_users_scanned,
+    )
+    anyone_link_files_count = anyone_link_data["anyone_link_files_count"]
+    anyone_link_evidence = anyone_link_data["anyone_link_evidence"]
+    anyone_link_source = anyone_link_data["anyone_link_source"]
+    anyone_title = anyone_link_data["anyone_title"]
+    anyone_remediation = anyone_link_data["anyone_remediation"]
+    if len(public_web_files) == 0 and user_owner_public_web_files:
+        public_web_files = user_owner_public_web_files
+
+    mobile_data = collect_mobile_device_observations(access_token)
+    mobile_devices = mobile_data["mobile_devices"]
+    unencrypted_mobile_devices = mobile_data["unencrypted_mobile_devices"]
+
+    findings = build_findings_list(
+        super_admin_without_2sv,
+        no_2sv_enforced,
+        risky_tokens,
+        suspicious_logins,
+        external_sharing_events,
+        anyone_link_files_count,
+        anyone_link_evidence,
+        anyone_title,
+        anyone_remediation,
+        public_web_files,
+        domain_rows,
+        admin_event_counts,
+        token_event_counts,
+        groups_anyone_can_join,
+        groups_anyone_can_view,
+        stale_active_users,
+        drive_scan_error,
+        user_owner_scan_errors,
+        groups_scan_error,
+        groups_settings_errors,
+        unencrypted_mobile_devices,
+    )
+    admin_change_keys = [
+        "ADD_TO_TRUSTED_OAUTH2_APPS",
+        "CHANGE_APP_ACCESS",
+        "AUTHORIZE_API_CLIENT_ACCESS",
+        "ASSIGN_ROLE",
+        "USER_PUT_IN_TWO_STEP_VERIFICATION_GRACE_PERIOD",
+        "CHANGE_APPLICATION_SETTING",
+        "CREATE_APPLICATION_SETTING",
+    ]
+    admin_security_change_count = sum(admin_event_counts.get(k, 0) for k in admin_change_keys)
+    token_authorize_count = int(token_event_counts.get("authorize", 0))
 
     summary = {
         "totalUsers": len(users),
