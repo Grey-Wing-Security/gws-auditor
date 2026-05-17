@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+import time
 import urllib.parse
 from collections import Counter
 
@@ -94,6 +95,11 @@ LOGO_MIME_BY_EXT = {
     ".gif": "image/gif",
     ".svg": "image/svg+xml",
 }
+
+API_GET_MAX_ATTEMPTS = 5
+API_GET_BASE_BACKOFF_SECONDS = 1.0
+API_GET_MAX_BACKOFF_SECONDS = 16.0
+API_GET_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 
 GRADE_THRESHOLDS = (
     (90, "A"),
@@ -189,15 +195,37 @@ def refresh_access_token(token_data, client_id, client_secret):
 
 
 def api_get(url, access_token, params=None):
-    r = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {access_token}"},
-        params=params or {},
-        timeout=60,
-    )
-    if r.status_code >= 400:
+    for attempt in range(1, API_GET_MAX_ATTEMPTS + 1):
+        try:
+            r = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params=params or {},
+                timeout=60,
+            )
+        except requests.RequestException as e:
+            if attempt >= API_GET_MAX_ATTEMPTS:
+                raise RuntimeError(f"HTTP transport error GET {url}: {str(e)[:300]}") from e
+            wait_seconds = min(API_GET_MAX_BACKOFF_SECONDS, API_GET_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            time.sleep(wait_seconds)
+            continue
+
+        if r.status_code < 400:
+            return r.json()
+
+        if r.status_code in API_GET_RETRY_STATUS_CODES and attempt < API_GET_MAX_ATTEMPTS:
+            retry_after_header = (r.headers.get("Retry-After") or "").strip()
+            wait_seconds = None
+            if retry_after_header.isdigit():
+                wait_seconds = max(0, int(retry_after_header))
+            if wait_seconds is None:
+                wait_seconds = min(API_GET_MAX_BACKOFF_SECONDS, API_GET_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+            time.sleep(wait_seconds)
+            continue
+
         raise RuntimeError(f"HTTP {r.status_code} GET {url}: {r.text[:1000]}")
-    return r.json()
+
+    raise RuntimeError(f"Retries exhausted GET {url}")
 
 
 def paged_get(url, item_key, access_token, params=None):
