@@ -87,6 +87,15 @@ With OAuth token:
 python email_domain_check.py --token-file ./gadmin_token.json --output ./email_domain_health.json
 ```
 
+With OAuth token + automatic refresh when expired:
+
+```bash
+python email_domain_check.py \
+  --token-file ./gadmin_token.json \
+  --client-secret /path/to/client_secret.json \
+  --output ./email_domain_health.json
+```
+
 With delegated service account:
 
 ```bash
@@ -95,6 +104,20 @@ python email_domain_check.py \
   --impersonate-admin admin@yourdomain.com \
   --output ./email_domain_health.json
 ```
+
+Optional: include custom DKIM selectors (repeat flag):
+
+```bash
+python email_domain_check.py \
+  --token-file ./gadmin_token.json \
+  --dkim-selector mx1 \
+  --dkim-selector outbound2026 \
+  --output ./email_domain_health.json
+```
+
+Notes:
+- DKIM probing now checks an expanded selector set and reports unknown/indeterminate status separately from explicit missing.
+- DNS TXT queries use retry/backoff; transient DNS failures are surfaced in output (`dns_issues`) instead of silently scoring as missing controls.
 
 ## Output artifacts
 
