@@ -1626,8 +1626,14 @@ def render_report_html(findings, customer, prepared_by, logo_url, findings_path=
     )
 
     generated_at_raw = str(findings.get("generatedAt", to_iso(utc_now())))
+    generated_date_text = generated_at_raw
+    try:
+        generated_dt = dt.datetime.fromisoformat(generated_at_raw.replace("Z", "+00:00"))
+        generated_date_text = f"{generated_dt.strftime('%B')} {generated_dt.day}, {generated_dt.year}"
+    except Exception:
+        pass
     assessment_date = html.escape(generated_at_raw[:10])
-    generated_at = html.escape(generated_at_raw)
+    generated_at = html.escape(generated_date_text)
     customer = html.escape(customer)
     prepared_by = html.escape(prepared_by)
     findings_path = html.escape(findings_path or "")
